@@ -1,0 +1,134 @@
+---
+title: "word2vec Topic Models"
+author: "Darren Kwong"
+date: "December 9, 2017"
+output: html_document
+---
+
+#Description
+In this project, I try to design two functions that leverages word2vec models and Latent Direchlict Analyses in order to find topics for short survey answers. The first function builds a distance matrix using Google's word2vec model. The second function creates clusters based on the distance matrix. The third function takes the clusters and inserts them into an structural LDA model in order to generate topics.
+
+We combine both word2vec and LDA models, because by itself, LDA does a poor job modeling short texts. Word2vec provides more data to build a more reliable model.
+
+#Import libraries
+```{r Data preparation}
+
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(tidytext)
+library(tm)
+library(wordVectors)
+library(data.table)
+library(fpc)
+```
+#Load Google word2vec model
+Google's word2vec model can be downlaoded here: [link](https://drive.google.com/file/d/0B7XkCwpI5KDYNlNUTTlSS21pQmM/edit?usp=sharing)
+```{r Load word2vec}
+google_word2vec <- read.vectors("C:/Users/User/Desktop/text_mining/GoogleNews.bin", nrows=100000)
+```
+
+#Functions
+##Buildiong a distance matrix
+Using Google's pre-trained word2vec model, the "build_dist_matrix" function cleans and prepares the column of short text data for modeling. Then, the function gets average word vector for each short answer. Using the average word vector, cosine distances are calculated between short answers, and a distance matrix is built. A distance matrix is akin to a correlation matrix.
+```{r build_dist_matrix}
+build_dist_matrix <- function(data_name, unique_id, text_variable) {
+  #Call data with "stop words" that we will use to remove stop words from text
+  data("stop_words")
+  #Prepare function arguments to be called in functions below
+  text_variable <- enquo(text_variable)
+  unique_id_dplyr <- enquo(unique_id)
+  unique_id_sub <- substitute(unique_id)
+  unique_id_char <- as.character(unique_id_sub)
+  #Clean data including removing punctuation, lowering cases, removing stop words, and taking out NA from analysis. After cleaning, we reshape the text column, so that words are in lists. We put that lists through a vector and get text2vec vectors. In this function, we use Google's Word2Vec pre-trained model.
+  df_01 <- data_name %>% 
+    select(!!unique_id_dplyr, !!text_variable) %>% 
+    mutate(new_column = removePunctuation(as.character(!!text_variable)),
+           new_column = sapply(new_column, tolower),
+           new_column = trimws(removeWords(new_column, stop_words$word)),
+           new_column = if_else(new_column=="", NA_character_, new_column)
+    ) %>%
+    filter(!is.na(new_column)) %>% 
+    unnest_tokens(word, new_column) %>% 
+    group_by(!!unique_id_dplyr) %>% 
+    summarize(words = list(word)) %>% 
+    mutate(words_vector = lapply(words, 
+                                 function(words_vector) {
+                                   google_word2vec[[words_vector, average=T]]
+                                 }))
+  #Reshape data through a cross join. We use data.table package to do a "cartesian" join.
+  df_01 <- as.data.table(df_01)
+  df_01 <- setkey(df_01[,c(k=1,.SD)],k)[df_01[,c(k=1,.SD)], allow.cartesian=TRUE][,k:=NULL]
+  #With cross joined table, we can find the cosine Distance
+  df_01 <- df_01 %>% 
+    mutate(words_vector_distance = 1 - mapply(cosineDist, words_vector, i.words_vector))
+  #Once we have the cosine Distance in long format, we need to reshape the data one last time by making it a square matrix (same number of columns as rows). The end result looks like a correlation matrix.
+  dcast_formula <- paste0(unique_id_sub, " ~ i.", unique_id_sub)
+  df_01 <- dcast.data.table(data.table(df_01), formula = dcast_formula, value.var = "words_vector_distance", fill=0L)
+  #In order to set up for clustering, we need to turn the "unique_id" column into a row_index. We keep the "unique_id" so that we can relate it back to the main data frame later.
+  df_01 <- column_to_rownames(df_01, var = unique_id_char)
+  df_01 <- 1 - df_01
+}
+```
+##Create clusters
+Using the distance matrix, we cluster our data using hierarchical clustering. These clusters wil be used in our LDA model.
+```{r}
+cluster_wordvectors <- function(distance_matrix, unique_id_name, new_cluster_variable_name) {
+  #Prepare function arguments to be called in functions below
+  unique_id_name_sub <- substitute(unique_id_name)
+  unique_id_name_sub <- as.character(unique_id_name_sub)
+  new_cluster_variable_name_sub <- substitute(new_cluster_variable_name)
+  new_cluster_variable_name_sub <- as.character(new_cluster_variable_name_sub)
+  #We calculate the number of rows by half of the distance matrix, because that number will be our arbitrary # of clusters (k clusters). That is necessary in order to build the cluster model. The number is arbitrary, because I rely on the Calinski-Harabasz index to choose the number of clusters we need for each model.
+  number_of_rows <- nrow(distance_matrix)
+  number_of_rows_halved <- number_of_rows/2
+  #We build the clusters
+  distance <- as.dist(distance_matrix)
+  cluster_vectors <- hclust(distance)
+  cluster_vectors_cut <- cutree(cluster_vectors, k=number_of_rows_halved)
+  #Calculate Calinski-Harabasz index
+  cluster_ch_index <- calinhara(distance, cluster_vectors_cut)
+  cluster_numbers <- round(cluster_ch_index, digits=0)
+  #Using Calinski-Harabasz index, we rebuild the cluster model
+  cluster_vectors_cut <- cutree(cluster_vectors, k=cluster_numbers)
+  #Finally we create a data frame with "unique_id" and the cluster group that we believe the "unique_id" belongs in.
+  df_clusters <- as.data.frame(cluster_vectors_cut) 
+  colnames(df_clusters)[colnames(df_clusters) == 'cluster_vectors_cut'] <- new_cluster_variable_name_sub
+  df_clusters <- rownames_to_column(df_clusters, unique_id_name_sub)
+  return(df_clusters)
+}
+
+```
+##Create topic model
+This final function builds a structural topic model using the clusters that we generated to help inform the model.
+```{r Function: Structural topic model}
+create_topic_model <- function(data_name, unique_id, text_variable, cluster_variable) {
+  data("stop_words")
+  text_variable_enquo <- enquo(text_variable)
+  unique_id_enquo <- enquo(unique_id)
+  unique_id_sub <- substitute(unique_id)
+  unique_id_char <- as.character(unique_id_sub)
+  cluster_variable_enquo <- enquo(cluster_variable)
+  cluster_variable_sub <- substitute(cluster_variable)
+  cluster_variable_char <- as.character(cluster_variable_sub)
+  df_01 <- data_name %>% 
+    select(!!unique_id_enquo, !!text_variable_enquo, !!cluster_variable_enquo) %>% 
+    filter(!is.na(!!cluster_variable_enquo)) %>% 
+    mutate(id_variable = as.character(!!unique_id_enquo),
+           text_variable = as.character(!!text_variable_enquo),
+           cluster_variable = as.character(!!cluster_variable_enquo)) %>%
+    select(id_variable, text_variable, cluster_variable)
+  text_processed <- textProcessor(documents = df_01$text_variable, metadata = df_01)
+  k_clusters <- max(data_name[,cluster_variable_char], na.rm=TRUE)
+  meta <- text_processed$meta
+  vocab <- text_processed$vocab
+  docs <- text_processed$documents
+  out <- prepDocuments(docs, vocab, meta)
+  out_document <- out$meta$text_variable
+  model <- stm(out$documents, out$vocab, K = k_clusters, content= ~ cluster_variable,  data=out$meta)
+  
+  outputs <- list("df" = df_01, "processed_text" = out_document, "model"=model)
+  return(outputs)
+}
+
+```
